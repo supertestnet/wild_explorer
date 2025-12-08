@@ -1,0 +1,841 @@
+<!DOCTYPE html>
+<html>
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, user-scalable=no">
+        <title>Wild Explorer</title>
+        <script src="https://unpkg.com/@cmdcode/tapscript@latest"></script>
+        <!-- <script src="file:///home/supertestnet/bitcoin_projects/node_faker/node_faker.js"></script> -->
+        <script src="https://supertestnet.github.io/node_faker/node_faker.js"></script>
+        <script>
+            var wild_explorer = {
+                blocks: {},
+                heights: {},
+                utxo_set: {},
+                mempool: [],
+                utxos: {},
+                addresses: {},
+                relays: [ "wss://no.str.cr" ],
+                waitToLoadTxCounts: false,
+                // relays: [ "ws://127.0.0.1:6969/" ],
+                blocks_relayed: [],
+                addykind: undefined, //undefined === mainnet
+                hexToBytes: hex => Uint8Array.from( hex.match( /.{1,2}/g ).map( byte => parseInt( byte, 16 ) ) ),
+                bytesToHex: bytes => bytes.reduce( ( str, byte ) => str + byte.toString( 16 ).padStart( 2, "0" ), "" ),
+                satsToBitcoin: sats => {
+                    var btc = String( sats ).padStart( 8, "0" ).slice( 0,-8 ) + "." + String( sats ).padStart( 8, "0" ).slice( -8 );
+                    if ( btc.endsWith( "00000" ) ) {
+                        btc = btc.substring( 0, btc.length - 5 );
+                        var i; for ( i=0; i<5; i++ ) {
+                            if ( btc.endsWith( "0" ) ) btc = btc.substring( 0, btc.length - 1 );
+                        }
+                        if ( btc.endsWith( "." ) ) btc = btc.substring( 0, btc.length - 1 );
+                        if ( !btc ) btc = 0;
+                    }
+                    return btc;
+                },
+                bitcoinToSats: btc => Math.floor( btc * 100_000_000 ),
+                showTx: async ( txid, is_coinbase, blockheight ) => {
+                    var txinfo = await node_faker.processCommand( `getrawtransaction ${txid} 1` );
+                    var txhex = txinfo.hex;
+                    $( '.tx_explorer' ).setAttribute( "data-txhex", txhex );
+                    var unique = wild_explorer.bytesToHex( window.crypto.getRandomValues( new Uint8Array( 32 ) ) );
+                    var background_color = "pink";
+                    var txs_html = ``;
+                    var tx = tapscript.Tx.decode( txhex );
+                    var display_fee = is_coinbase ? "" : "hidden";
+                    var tx_html = `
+                        <div class="tx ${background_color} tx_${txid} unique_${unique}">
+                            <div>Txid: <span class="txid txid_link" data-is_coinbase="${is_coinbase ? 1 : 0}">${txid}</span></div>
+                            <div class="${display_fee}">Fee: <span class="fee">0</span> btc</div>
+                            <div class="inputs"></div>
+                            <div class="outputs"></div>
+                        </div>
+                    `;
+                    var div = document.createElement( 'div' );
+                    div.innerHTML = tx_html;
+                    var inputs_html = ``;
+                    var outputs_html = ``;
+                    var i; for ( i=0; i<tx.vin.length; i++ ) {
+                        var input = tx.vin[ i ];
+                        var index = i;
+                        if ( !index ) inputs_html = `<p style="text-align: center;">Inputs</p>`;
+                        var input_id = `${input[ "txid" ]}_${input[ "vout" ]}`;
+                        if ( is_coinbase ) {
+                            var from_addy = "";
+                        } else {
+                            var para = document.createElement( "p" );
+                            para.innerText = `loading input ${i+1} of ${tx.vin.length}`;
+                            $( '.status' ).prepend( para );
+                            var utxo_info = await wild_explorer.getUtxoInfo( input_id, blockheight );
+                            var from_addy = utxo_info.addy;
+                        }
+                        try {
+                            from_addy = tapscript.Address.fromScriptPubKey( from_addy, wild_explorer.addykind );
+                        } catch( e ) {}
+                        if ( is_coinbase ) var amnt_sent = "";
+                        else {
+                            var utxo_info = await wild_explorer.getUtxoInfo( input_id );
+                            var amnt_sent = utxo_info.amnt;
+                        }
+                        var input_txid = input[ "txid" ];
+                        var input_vout = input[ "vout" ];
+                        if ( is_coinbase ) var input_txhex = "";
+                        else {
+                            var input_info = await wild_explorer.getUtxoInfo( `${input[ "txid" ]}_${input[ "vout" ]}` );
+                            var input_txhex = input_info[ "txhex" ];
+                        }
+                        var vin_bg_color = "yellow";
+                        if ( index % 2 ) vin_bg_color = "green";
+                        if ( is_coinbase ) inputs_html = inputs_html + `<div class="input ${vin_bg_color}">Coinbase</div>`;
+                        else inputs_html = inputs_html + `
+                            <div class="input ${vin_bg_color}">
+                                <p>"From" address: <span class="from_address addy_link">${from_addy}</span></p>
+                                <p>Amount sent from this address in this tx: <span class="amnt_sent">${wild_explorer.satsToBitcoin( amnt_sent )} btc</span></p>
+                                <p>Tx that originally created this input: <span class="input_txid txid_link" data-is_coinbase="${is_coinbase ? 1 : 0}">${input_txid}</span></p>
+                                <p>Vout of that tx: <span class="input_vout">${input[ "vout" ]}</span></p>
+                                <p style="display: none;"><button class="view_script" onclick="wild_explorer.viewScript( '${input_txid}_${input[ "vout" ]}', '${txid}_${index}', '${unique}' );">View bitcoin script</button></p>
+                                <div class="btc_script hidden">
+                                    <p class="script_arguments_label">Arguments</p>
+                                    <div class="script_arguments"></div>
+                                    <p class="script_program_label">Program</p>
+                                    <div class="script_program"></div>
+                                </div>
+                            </div>
+                        `;
+                    }
+                    div.getElementsByClassName( "inputs" )[ 0 ].innerHTML = inputs_html;
+                    var i; for ( i=0; i<tx.vout.length; i++ ) {
+                        var output = tx.vout[ i ];
+                        var index = i;
+                        if ( !index ) outputs_html = `<p style="text-align: center;">Outputs</p>`;
+                        var output_id = `${txid}_${index}`;
+                        var utxo_info = await wild_explorer.getUtxoInfo( output_id );
+                        var addy = utxo_info.addy;
+                        try {
+                            addy = tapscript.Address.fromScriptPubKey( addy, wild_explorer.addykind );
+                        } catch( e ) {}
+                        var amnt = utxo_info.amnt;
+                        var vout_bg_color = "white";
+                        if ( index % 2 ) vout_bg_color = "grey";
+                        outputs_html = outputs_html + `
+                            <div class="output ${vout_bg_color}">
+                                <p>Vout: <span class="which_vout_is_this">${index}</span></p>
+                                <p>"To" address: <span class="to_address addy_link">${addy}</span></p>
+                                <p>Amount received by this address in this tx: <span class="amnt_received">${wild_explorer.satsToBitcoin( amnt )} btc</span></p>
+                            </div>
+                        `;
+                    }
+                    div.getElementsByClassName( "outputs" )[ 0 ].innerHTML = outputs_html;
+                    var sum_of_inputs = 0;
+                    var i; for ( i=0; i<tx.vin.length; i++ ) {
+                        if ( is_coinbase ) break;
+                        var input = tx.vin[ i ];
+                        var input_id = `${input[ "txid" ]}_${input[ "vout" ]}`;
+                        var utxo_info = await wild_explorer.getUtxoInfo( input_id );
+                        var amnt = utxo_info.amnt;
+                        sum_of_inputs = sum_of_inputs + amnt;
+                    }
+                    var sum_of_outputs = 0;
+                    tx.vout.forEach( output => sum_of_outputs = sum_of_outputs + Number( output[ "value" ] ) );
+                    if ( is_coinbase ) sum_of_outputs = 0;
+                    div.getElementsByClassName( "fee" )[ 0 ].innerText = wild_explorer.satsToBitcoin( sum_of_inputs - sum_of_outputs );
+                    txs_html = txs_html + div.innerHTML;
+                    return txs_html;
+                },
+                showSoloTx: async ( txid, is_coinbase, block_mined_if_coinbase ) => {
+                    wild_explorer.waitToLoadTxCounts = true;
+                    $( '.status' ).innerHTML = `loading...`;
+                    showPage( 'loading' );
+                    $( '.explorer_txid' ).innerText = `Tx ${txid.substring( 0, 4 )}...${txid.substring( txid.length - 4 )}`;
+                    $( '.tx_info' ).innerHTML = await wild_explorer.showTx( txid, is_coinbase );
+                    showPage( 'tx_explorer' );
+                    $$( '.close_explorer' ).forEach( close_btn => {
+                        close_btn.onclick = () => {
+                            showPage( 'stuff_thats_not_an_explorer' );
+                        }
+                    });
+                    var txhex = $( `.tx_explorer` ).getAttribute( "data-txhex" );
+                    var tx = tapscript.Tx.decode( txhex );
+                    var inputs_count = tx.vin.length;
+                    $( '.inputs_count' ).innerText = inputs_count;
+                    var outputs_count = tx.vout.length;
+                    $( '.outputs_count' ).innerText = outputs_count;
+                    var utxo_info = await wild_explorer.getUtxoInfo( `${txid}_0` );
+                    if ( !isNaN( utxo_info.block_created ) ) {
+                        var mined_in_block = utxo_info.block_created;
+                        $( '.mined_in_block' ).innerHTML = `${mined_in_block} [<span class="block_link" data-blocknum="${mined_in_block}">view block</span>]`;
+                        $( '.block_link' ).onclick = e => {wild_explorer.showBlockDetails( e.target.getAttribute( "data-blocknum" ) )}
+                        var blockhash = await wild_explorer.getHashFromHeight( mined_in_block );
+                        // var { timestamp } = await wild_explorer.getBlockInfo( blockhash );
+                        // $( '.tx_timestamp' ).innerText = String( new Date( timestamp * 1000 ) );
+                    } else {
+                        var mined_in_block = "not mined yet";
+                        if ( block_mined_if_coinbase ) mined_in_block = block_mined_if_coinbase;
+                        $( '.mined_in_block' ).innerHTML = `${mined_in_block}`;
+                    }
+                    var tx_size = tapscript.Tx.util.getTxSize( txhex ).vsize;
+                    $( '.tx_size' ).innerText = `${tx_size} bytes`;
+                    var sum_of_inputs = 0;
+                    var i; for ( i=0; i<tx.vin.length; i++ ) {
+                        if ( is_coinbase ) break;
+                        var input = tx.vin[ i ];
+                        var input_id = `${input[ "txid" ]}_${input[ "vout" ]}`;
+                        var utxo_info = await wild_explorer.getUtxoInfo( input_id );
+                        var amnt = utxo_info.amnt;
+                        sum_of_inputs = sum_of_inputs + amnt;
+                    }
+                    var sum_of_outputs = 0;
+                    tx.vout.forEach( output => sum_of_outputs = sum_of_outputs + Number( output[ "value" ] ) );
+                    if ( is_coinbase ) sum_of_outputs = 0;
+                    var tx_fee_in_sats = sum_of_inputs - sum_of_outputs;
+                    $( '.tx_fee' ).innerText = `${wild_explorer.satsToBitcoin( tx_fee_in_sats )} btc`;
+                    $( '.tx_feerate' ).innerText = `${( tx_fee_in_sats / tx_size ).toFixed( 2 )} sats per byte`;
+                    window.scrollTo( 0, 0 );
+                    $$( '.txid_link' ).forEach( item => {
+                        item.onclick = e => {
+                            var txid = e.target.innerText;
+                            var is_coinbase = Number( e.target.getAttribute( "data-is_coinbase" ) ) === 1;
+                            wild_explorer.showSoloTx( txid, is_coinbase, block_mined_if_coinbase );
+                        }
+                    });
+                    $$( '.addy_link' ).forEach( item => {
+                        item.onclick = e => {
+                            var addy = e.target.innerText;
+                            wild_explorer.showAddyInfo( addy );
+                        }
+                    });
+                    wild_explorer.waitToLoadTxCounts = false;
+                },
+                showAddyInfo: async addy => {
+                    wild_explorer.waitToLoadTxCounts = true;
+                    showPage( 'loading' );
+                    $( '.status' ).innerHTML = `loading...`;
+                    node_faker.status = {
+                        command: `scantxoutset start '["addr(${addy})"]'`,
+                        message: "loading...",
+                    }
+                    var loop = async () => {
+                        await node_faker.waitSomeTime( 1000 );
+                        var para = document.createElement( "p" );
+                        if ( node_faker.status && node_faker.status.command === `scantxoutset start '["addr(${addy})"]'` ) para.innerText = node_faker.status.message;
+                        $( '.status' ).prepend( para );
+                        if ( node_faker.status && node_faker.status.command === `scantxoutset start '["addr(${addy})"]'` ) return loop();
+                    }
+                    loop();
+                    var addy_info = await node_faker.processCommand( `scantxoutset start '["addr(${addy})"]'` );
+                    $( '.explorer_addy' ).innerText = `${addy.substring( 0, 4 )}...${addy.substring( addy.length - 4 )}`;
+                    $( '.full_address' ).innerText = addy;
+                    var spky = addy !== "51024e73" ? tapscript.Script.encode( tapscript.Address.toScriptPubKey( addy ) ).hex.substring( 2 ) : "51024e73";
+                    $( '.num_of_utxos' ).innerText = addy_info.unspents.length;
+                    $( '.addy_balance' ).innerText = `${addy_info.total_amount} btc`;
+                    var txs_html = `<p style="text-align: center; font-weight: bold;">Transactions that created an output for this address that is not spent yet</p>`;
+                    var i; for ( i=0; i<addy_info.unspents.length; i++ ) {
+                        var utxo = addy_info.unspents[ i ];
+                        var txid = utxo.txid;
+                        var height = utxo.height;
+                        var coinbase = utxo.coinbase;
+                        var txs_html = txs_html + `<p class="txid_link" data-is_coinbase="${coinbase ? 1 : 0}" data-blockheight="${height}">${txid}</p>`;
+                    }
+                    $( '.addy_tx_info' ).innerHTML = txs_html;
+                    $$( '.txid_link' ).forEach( ( item, index ) => {
+                        item.onclick = e => {
+                            var txid = e.target.innerText;
+                            var is_coinbase = Number( e.target.getAttribute( "data-is_coinbase" ) ) === 1;
+                            var num = Number( e.target.getAttribute( "data-blockheight" ) );
+                            wild_explorer.showSoloTx( txid, is_coinbase, num );
+                        }
+                    });
+                    $$( '.close_explorer' ).forEach( close_btn => {
+                        close_btn.onclick = () => {
+                            showPage( 'stuff_thats_not_an_explorer' );
+                        }
+                    });
+                    window.scrollTo( 0, 0 );
+                    wild_explorer.waitToLoadTxCounts = false;
+                    showPage( 'addy_explorer' );
+                },
+                showBlockDetails: async num => {
+                    wild_explorer.waitToLoadTxCounts = true;
+                    $( '.status' ).innerHTML = `loading...`;
+                    showPage( 'loading' );
+                    var blockhash = await wild_explorer.getHashFromHeight( num );
+                    var { height, timestamp, fees, txs } = await wild_explorer.getBlockInfo( blockhash );
+                    var subsidy = wild_explorer.getBlockReward( height );
+                    showPage( 'block_explorer' );
+                    $( '.explorer_blockhash' ).innerText = blockhash;
+                    $( '.explorer_block_num' ).innerText = `Block ${num}`;
+                    $$( '.close_explorer' ).forEach( close_btn => {
+                        close_btn.onclick = () => {
+                            showPage( 'stuff_thats_not_an_explorer' );
+                        }
+                    });
+                    $( '.tx_count' ).innerText = txs.length;
+                    $( '.block_timestamp' ).innerText = String( new Date( timestamp * 1000 ) );
+                    $( '.block_subsidy' ).innerText = `${wild_explorer.satsToBitcoin( subsidy )} btc`;
+                    $( '.block_fees' ).innerText = `${wild_explorer.satsToBitcoin( fees )} btc`;
+                    $( '.txs' ).innerHTML = ``;
+                    var txs_html = ``;
+                    var i; for ( i=0; i<txs.length; i++ ) {
+                        var txid = txs[ i ];
+                        var txs_html = txs_html + `<p class="txid_link" data-is_coinbase="${i === 0 ? 1 : 0}">${txid}</p>`;
+                    }
+                    $( '.txs' ).innerHTML = txs_html;
+                    $$( '.txid_link' ).forEach( ( item, index ) => {
+                        item.onclick = e => {
+                            var txid = e.target.innerText;
+                            var is_coinbase = Number( e.target.getAttribute( "data-is_coinbase" ) ) === 1;
+                            wild_explorer.showSoloTx( txid, is_coinbase, num );
+                        }
+                    });
+                    wild_explorer.waitToLoadTxCounts = false;
+                },
+                showBlock: ( num, count, prepend ) => {
+                    var div = document.createElement( "div" );
+                    div.innerHTML = `
+                        <div class="block">
+                            <div class="block_inner">
+                                <div class="block_back"></div>
+                                <div class="block_side1"></div>
+                                <div class="block_side2"></div>
+                                <div class="block_side3"></div>
+                                <div class="block_side4"></div>
+                                <div class="block_front"><div>tx count:<br>${count}</div></div>
+                                <div class="block_num">${num}</div>
+                            </div>
+                        </div>
+                    `;
+                    var block = div.firstElementChild;
+                    block.setAttribute( "data-height", num );
+                    if ( $( '.block' ) ) {
+                        var blockwidth = 229;
+                        var desired_width = Math.max( ( blockwidth * ( $$( '.block' ).length + 1 ) ), window.innerWidth );
+                        $( '.list_of_blocks' ).style.width = desired_width + "px";
+                        $( '.list_container' ).scrollTo({
+                            top: 0,
+                            left: $( '.list_of_blocks' ).offsetWidth,
+                            behavior: "smooth",
+                        });
+                    }
+                    $( '.no_blocks_msg' ).classList.add( "hidden" );
+                    block.onclick = () => {wild_explorer.showBlockDetails( num );}
+                    if ( !prepend ) $( '.list_of_blocks' ).append( block );
+                    else $( '.list_of_blocks' ).prepend( block );
+                },
+                viewScript: async ( txid_and_vout_of_utxo_being_spent, txid_and_vout_in_which_it_is_spent, unique ) => {
+                    var vout_of_utxo_being_spent = Number( txid_and_vout_of_utxo_being_spent.split( "_" )[ 1 ] );
+                    var txid_in_which_it_is_spent = txid_and_vout_in_which_it_is_spent.split( "_" )[ 0 ];
+                    var vout_in_which_it_is_spent = Number( txid_and_vout_in_which_it_is_spent.split( "_" )[ 1 ] );
+                    var utxo_info = await wild_explorer.getUtxoInfo( txid_and_vout_of_utxo_being_spent );
+                    var spubkey_of_utxo_being_spent = tapscript.Tx.decode( utxo_info.txhex ).vout[ vout_of_utxo_being_spent ].scriptPubKey;
+                    var witness_info = await wild_explorer.getUtxoInfo( `${txid_in_which_it_is_spent}_0` );
+                    var witness_of_utxo_being_spent = tapscript.Tx.decode( witness_info.txhex ).vin[ vout_in_which_it_is_spent ].witness;
+                    if ( !witness_of_utxo_being_spent.length ) {
+                        var script_arguments = [];
+                        var script_program = tapscript.Script.decode( spubkey_of_utxo_being_spent );
+                    }
+                    if ( witness_of_utxo_being_spent.length === 1 ) {
+                        var script_arguments = [ witness_of_utxo_being_spent[ 0 ] ];
+                        var script_program = [
+                            tapscript.Script.decode( spubkey_of_utxo_being_spent )[ 1 ],
+                            "OP_CHECKSIG",
+                        ];
+                    }
+                    if ( witness_of_utxo_being_spent.length > 1 ) {
+                        var script_arguments = JSON.parse( JSON.stringify( witness_of_utxo_being_spent ) );
+                        script_arguments.length = script_arguments.length - 2;
+                        var script_program = tapscript.Script.decode( witness_of_utxo_being_spent[ witness_of_utxo_being_spent.length - 2 ] );
+                    }
+                    var script_div = $$( `.unique_${unique} .input .btc_script` )[ vout_in_which_it_is_spent ];
+                    var button = $$( `.unique_${unique} .input .view_script` )[ vout_in_which_it_is_spent ];
+                    if ( script_div.classList.contains( "hidden" ) ) {
+                        script_div.classList.remove( "hidden" );
+                        button.innerText = "Hide bitcoin script";
+                        script_div.getElementsByClassName( "script_arguments" )[ 0 ].innerHTML = `<p class="script_element">${script_arguments.join( `</p><p class="script_element">` )}</p>`;
+                        script_div.getElementsByClassName( "script_program" )[ 0 ].innerHTML = `<p class="script_element">${script_program.join( `</p><p class="script_element">` )}</p>`;
+                    } else {
+                        script_div.classList.add( "hidden" );
+                        button.innerText = "Show bitcoin script";
+                    }
+                },
+                getBlockReward: blockheight => {
+                    var subsidy = 50n * 100_000_000n;
+                    var halving_interval = 210_000;
+                    var halvings = Math.floor( blockheight / halving_interval );
+                    if ( halvings >= 64 ) return 0;
+                    subsidy >>= BigInt( halvings );
+                    return Number( subsidy );
+                },
+                getUtxoInfo: async ( input_id, blockheight_spent ) => {
+                    if ( wild_explorer.utxo_set.hasOwnProperty( input_id ) ) return wild_explorer.utxo_set[ input_id ];
+                    var txid = input_id.split( "_" )[ 0 ];
+                    var vout_of_sought_utxo = Number( input_id.split( "_" )[ 1 ] );
+                    var txinfo = await node_faker.processCommand( `getrawtransaction ${txid} 1` );
+                    var txhex = txinfo.hex;
+                    var txid = txinfo.txid;
+                    var block_info = await node_faker.processCommand( `getblockheader ${txinfo.blockhash}` );
+                    var height = block_info.height;
+                    var is_coinbase = txinfo.vin[ 0 ].hasOwnProperty( "coinbase" );
+                    txinfo.vout.forEach( ( output, vout ) => {
+                        if ( vout === vout_of_sought_utxo ) addy_i_want = output.scriptPubKey.hex;
+                        wild_explorer.utxo_set[ `${txid}_${vout}` ] = {
+                            txid: txid,
+                            vout,
+                            amnt: wild_explorer.bitcoinToSats( output[ "value" ] ),
+                            addy: output.scriptPubKey.hex,
+                            spent: false,
+                            txhex,
+                            is_coinbase,
+                            block_created: height,
+                            block_spent: blockheight_spent || undefined,
+                        }
+                    });
+                    return wild_explorer.utxo_set[ input_id ];
+                },
+                getBlockInfo: async hash => {
+                    if ( wild_explorer.blocks.hasOwnProperty( hash ) ) return wild_explorer.blocks[ hash ];
+                    $( '.status' ).innerHTML = `loading...`;
+                    node_faker.status = {
+                        command: `getblock ${hash}`,
+                        message: "loading...",
+                    }
+                    var loop = async () => {
+                        await node_faker.waitSomeTime( 1000 );
+                        var para = document.createElement( "p" );
+                        if ( node_faker.status && node_faker.status.command === `getblock ${hash}` ) para.innerText = node_faker.status.message;
+                        $( '.status' ).prepend( para );
+                        if ( node_faker.status && node_faker.status.command === `getblock ${hash}` ) return loop();
+                    }
+                    loop();
+                    var block_info = await node_faker.processCommand( `getblock ${hash}` );
+                    var height = block_info.height;
+                    wild_explorer.heights[ height ] = hash;
+                    var timestamp = block_info.time;
+                    var txs = block_info.tx;
+                    var coinbase = await node_faker.processCommand( `getrawtransaction ${txs[ 0 ]} 0` );
+                    coinbase = tapscript.Tx.decode( coinbase );
+                    var sum_of_cb_outputs = 0;
+                    coinbase.vout.forEach( vout => sum_of_cb_outputs = sum_of_cb_outputs + Number( vout.value ) );
+                    var subsidy = wild_explorer.getBlockReward( height );
+                    var fees = sum_of_cb_outputs - subsidy;
+                    if ( fees < 0 ) fees = 0;
+                    wild_explorer.blocks[ hash ] = {
+                        height,
+                        timestamp,
+                        fees,
+                        txs,
+                    }
+                    return wild_explorer.blocks[ hash ];
+                },
+                getHashFromHeight: async num => {
+                    if ( wild_explorer.heights.hasOwnProperty( num ) ) return wild_explorer.heights[ num ];
+                    var hash = await node_faker.processCommand( `getblockhash ${num}` );
+                    wild_explorer.heights[ num ] = hash;
+                    return wild_explorer.heights[ num ];
+                },
+                getHeightFromHash: async hash => {
+                    if ( wild_explorer.blocks.hasOwnProperty( hash ) ) return wild_explorer.blocks[ hash ].height;
+                    try {
+                        var height_data = await node_faker.processCommand( `getblockheader ${hash} 1` );
+                        return height_data.height;
+                    } catch ( e ) {
+                        return null;
+                    }
+                },
+            }
+        </script>
+        <style>
+            * {
+                box-sizing: border-box;
+                font-size: 1.15rem;
+                font-family: Arial, sans-serif;
+            }
+            body {
+                margin: 0;
+            }
+            .inner_html {
+                max-width: 800px;
+                padding: 3rem 1rem;
+                margin: auto;
+                line-height: 1.25;
+                padding: 0;
+            }
+            .inner_body {
+                margin: 3rem 1rem;
+                word-wrap: break-word;
+            }
+            h1 {
+                font-size: 2rem;
+            }
+            h2, h2 * {
+                font-size: 1.5rem;
+            }
+            input, textarea {
+                line-height: 1.25;
+                width: 100%;
+                height: 1.8rem;
+                font-size: 1.15rem;
+                border: 1px solid grey;
+            }
+            textarea {
+                height: 10rem;
+            }
+            .hidden {
+                display: none !important;
+            }
+            .list_container {
+                overflow-y: scroll;
+            }
+            .no_blocks_msg {
+                height: 248px;
+                line-height: 248px;
+                text-align: center;
+            }
+            .list_of_blocks {
+                display: flex;
+                justify-content: center;
+            }
+            .block {
+                display: inline-block;
+                height: 11.5rem;
+                width: 192px;
+                margin: 1rem;
+                cursor: pointer;
+                overflow: hidden;
+                flex-shrink: 0;
+            }
+            .block:hover {
+                background-color: pink;
+            }
+            .block_inner {
+                display: inline-block;
+                position: relative;
+                height: 9.5rem;
+                width: 7.5rem;
+                margin: 1.5rem;
+            }
+            .block_back {
+                border: 1px solid black;
+                height: 6rem;
+                width: 6rem;
+                float: right;
+                display: inline;
+                background-color: #232838;
+                border-left: 0;
+                border-bottom: 0;
+            }
+            .block_front {
+                border: 1px solid black;
+                height: 6rem;
+                width: 6rem;
+                display: flex;
+                align-items: center;
+                position: absolute;
+                bottom: 2rem;
+                background-color: #3953c6;
+                color: white;
+                text-align: center;
+            }
+            .block_front div {
+                width: 100%;
+            }
+            .block_side1 {
+                height: 2rem;
+                background-color: #02078e;
+                aspect-ratio: 1;
+                rotate: 45deg;
+                border-left: 1px solid black;
+                position: absolute;
+                top: .47rem;
+                left: 0.47rem;
+            }
+            .block_side2 {
+                height: 5.8rem;
+                background-color: #02078e;
+                position: absolute;
+                top: 1px;
+                left: 1.5rem;
+                width: 5.9rem;
+            }
+            .block_side3 {
+                height: 2.4rem;
+                width:1px;
+                background-color: black;
+                rotate: 45deg;
+                position: absolute;
+                top: -.3rem;
+                right: .85rem;
+            }
+            .block_side4 {
+                height: 2rem;
+                background-color: #02078e;
+                aspect-ratio: 1;
+                rotate: 45deg;
+                border-right: 1px solid black;
+                position: absolute;
+                bottom: 2.50rem;
+                right: 0.5rem;
+            }
+            .block_num {
+                position: absolute;
+                bottom: 0rem;
+                width: 80%;
+                text-align: center;
+            }
+            .wallet {
+                border: 1px solid black;
+                border-radius: 1rem;
+                padding: 1rem;
+                text-align: center;
+                margin-top: 1rem;
+            }
+            .auto_generate_label {
+                display: inline-block;
+            }
+            .wallet_btns, .broadcast_btn, .auto_generate_label,
+            .auto_go, .broadcast_success_label, .make_sharable {
+                margin-top: 1rem;
+            }
+            .block_info, .tx_info_label, .addy_info_label {
+                display: flex;
+                justify-content: space-between;
+            }
+            .block_explorer, .tx, .input, .output,
+            .tx_explorer, .addy_explorer, .btc_script {
+                border: 1px solid black;
+                border-radius: 1rem;
+                padding: 1rem;
+                margin-bottom: 1rem;
+            }
+            .close_explorer {
+                cursor: pointer;
+            }
+            .explorer_block_num, .explorer_txid,
+            .explorer_addy, .close_explorer {
+                padding: 1rem;
+            }
+            .explorer_block_num,.explorer_addy,
+            .explorer_txid {
+                padding-left: 0;
+            }
+            .txid_link, .block_link, .addy_link {
+                color: blue;
+                text-decoration: underline;
+                cursor: pointer;
+            }
+            .pink {
+                background-color: pink;
+            }
+            .lightblue {
+                background-color: lightblue;
+            }
+            .yellow {
+                background-color: yellow;
+            }
+            .green {
+                background-color: lightgreen;
+            }
+            .white {
+                background-color: white;
+            }
+            .grey {
+                background-color: #cccccc;
+            }
+            .script_arguments_label, .script_program_label {
+                font-weight: bold;
+            }
+            .btc_script {
+                .margin-bottom: auto;
+            }
+            @media screen and (max-width: 600px) {
+            }
+        </style>
+        <style>
+            .black-bg {
+                width: 100%;
+                position: fixed;
+                top: 0;
+                left: 0;
+                background-color: black;
+                opacity: .5;
+                width: 100vw;
+                height: 100vh;
+            }
+            .modal {
+                position: fixed;
+                box-sizing: border-box;
+                top: 50%;
+                left: 50%;
+                transform: translate(-50%,-50%);
+                width: 90%;
+                max-width: 560px;
+                background-color: white;
+                border-radius: 1rem;
+                padding: 20px;
+                color: black;
+                text-align: center;
+                word-wrap: break-word;
+            }
+            .modal * {
+                color: black;
+            }
+            .modal input, .modal textarea {
+                max-width: 90%;
+            }
+        </style>
+        <script>
+            var modalVanish = () => {
+                $( ".black-bg" ).classList.add( "hidden" );
+                $( ".modal" ).classList.add( "hidden" );
+            }
+            var showModal = content => {
+                $( ".modal" ).innerHTML = `<div class="x_modal" style="position: absolute;right: 1rem;top: 0.5rem;font-size: 2rem; cursor: pointer; color: black;" onclick="modalVanish()">&times;</div>`;
+                $( ".modal" ).innerHTML += `<div style="overflow-y: auto; max-height: 80vh; margin-top: 1.5rem;">${content}</div>`;
+                $( ".black-bg" ).classList.remove( "hidden" );
+                $( ".modal" ).classList.remove( "hidden" );
+            }
+        </script>
+        <script>
+            var $ = document.querySelector.bind( document );
+            var $$ = document.querySelectorAll.bind( document );
+            var url_params = new URLSearchParams( window.location.search );
+            var url_keys = url_params.keys();
+            var $_GET = {}
+            for ( var key of url_keys ) $_GET[ key ] = url_params.get( key );
+            var hash_arr = window.location.href.substring( window.location.href.indexOf( "#" ) ).split( "#" );
+            hash_arr.splice( 0, 1 );
+            var params = {}
+            hash_arr.forEach( item => {
+                var vals = item.split( "=" );
+                params[ vals[ 0 ] ] = vals[ 1 ];
+            });
+        </script>
+    </head>
+    <body>
+        <div class="list_container">
+            <div class="no_blocks_msg">loading...</div>
+            <div class="list_of_blocks"></div>
+        </div>
+        <div class="inner_html">
+            <div class="inner_body">
+                <h1>Wild Explorer</h1>
+                <div class="loading hidden"><div class="status"></div></div>
+                <div class="block_explorer hidden">
+                    <h2 class="block_info"><span class="explorer_block_num"></span><span class="close_explorer">&times;</span></h2>
+                    <p>Blockhash: <span class="explorer_blockhash"></span></p>
+                    <p>Transaction count: <span class="tx_count">0</span></p>
+                    <p>Timestamp: <span class="block_timestamp">None</span></p>
+                    <p>Subsidy: <span class="block_subsidy">50 btc</span></p>
+                    <p>Fees: <span class="block_fees">0 btc</span></p>
+                    <p style="font-weight: bold;">Transactions</p>
+                    <div class="txs"></div>
+                </div>
+                <div class="tx_explorer hidden">
+                    <h2 class="tx_info_label"><span class="explorer_txid"></span><span class="close_explorer">&times;</span></h2>
+                    <p>Number of inputs: <span class="inputs_count">0</span></p>
+                    <p>Number of outputs: <span class="outputs_count">0</span></p>
+                    <p>Mined in block: <span class="mined_in_block">None</span></p>
+                    <!-- <p>Timestamp: <span class="tx_timestamp">None</span></p> -->
+                    <p>Tx size: <span class="tx_size">0 bytes</span></p>
+                    <p>Tx fee: <span class="tx_fee">0 btc</span></p>
+                    <p>Feerate: <span class="tx_feerate">0 sats per byte</span></p>
+                    <div class="tx_info"></div>
+                </div>
+                <div class="addy_explorer hidden">
+                    <h2 class="addy_info_label"><span class="explorer_addy"></span><span class="close_explorer">&times;</span></h2>
+                    <p class="full_address"></p>
+                    <p>Number of utxos: <span class="num_of_utxos">0</span></p>
+                    <p>Address balance: <span class="addy_balance">0</span></p>
+                    <div class="addy_tx_info"></div>
+                </div>
+                <div class="stuff_thats_not_an_explorer">
+                    <p>Click a block to explore the blockchain. Or, enter one of the following things to explore: an address, a txid, a blockhash, or a blockheight</p>
+                    <p><input class="searchbar"></p>
+                    <div class="explore_btn"><button>Explore</button></div>
+                </div>
+            </div>
+        </div>
+        <script>
+            $( '.searchbar' ).value = "";
+            $( '.explore_btn' ).onclick = async () => {
+                wild_explorer.waitToLoadTxCounts = true;
+                var param = $( '.searchbar' ).value;
+                showPage( 'loading' );
+                $( '.status' ).innerText = 'checking if your search term is a block number...';
+                var is_num = !isNaN( param );
+                if ( is_num ) {
+                    $( '.status' ).innerText = 'getting blockhash...';
+                    var blockhash = await node_faker.processCommand( `getblockhash ${param}` );
+                    if ( blockhash.startsWith( "unknown error" ) ) {
+                        showPage( 'stuff_thats_not_an_explorer' );
+                        wild_explorer.waitToLoadTxCounts = false;
+                        return alert( 'the block you entered does not seem to exist, try again' );
+                    } else {
+                        wild_explorer.showBlockDetails( param );
+                        wild_explorer.waitToLoadTxCounts = false;
+                        return;
+                    }
+                }
+                $( '.status' ).innerText = 'checking if your search term is an address...';
+                var address_data = await node_faker.processCommand( `validateaddress ${param}` );
+                if ( address_data.isvalid ) {
+                    wild_explorer.waitToLoadTxCounts = false;
+                    wild_explorer.showAddyInfo( param );
+                    return;
+                }
+                $( '.status' ).innerText = 'checking if your search term is a txid...';
+                var txid_data = await node_faker.processCommand( `getrawtransaction ${param} 1` );
+                if ( typeof txid_data !== "string" ) {
+                    var is_coinbase = txid_data.vin[ 0 ].hasOwnProperty( "coinbase" );
+                    var blockhash = txid_data.blockhash;
+                    var block_mined_if_coinbase = null;
+                    if ( is_coinbase ) block_mined_if_coinbase = await wild_explorer.getHeightFromHash( hash );
+                    wild_explorer.waitToLoadTxCounts = false;
+                    wild_explorer.showSoloTx( param, is_coinbase, block_mined_if_coinbase );
+                    return;
+                }
+                $( '.status' ).innerText = 'checking if your search term is a blockhash...';
+                var blockheight = await wild_explorer.getHeightFromHash( param );
+                if ( !blockheight ) {
+                    showPage( 'stuff_thats_not_an_explorer' );
+                    wild_explorer.waitToLoadTxCounts = false;
+                    return alert( 'could not determine what you entered, please try again and contact a developer for help if this error persists' );
+                }
+                wild_explorer.showBlockDetails( blockheight );
+                wild_explorer.waitToLoadTxCounts = false;
+                return;
+            }
+            var showPage = page => {
+                $( '.block_explorer' ).classList.add( "hidden" );
+                $( '.tx_explorer' ).classList.add( "hidden" );
+                $( '.addy_explorer' ).classList.add( "hidden" );
+                $( '.stuff_thats_not_an_explorer' ).classList.add( "hidden" );
+                $( '.loading' ).classList.add( "hidden" );
+                $( `.${page}` ).classList.remove( "hidden" );
+            }
+            (async()=>{
+                node_faker.waitWhenParsingTxs = true;
+                var bc_info = await node_faker.processCommand( `getblockchaininfo` );
+                var bc_height = bc_info.blocks;
+                // var tx_count_info = await node_faker.processCommand( `getblockheader ${bc_info.bestblockhash}` );
+                // var tx_count = tx_count_info.nTx;
+                var prepend = true;
+                var i; for ( i=bc_height; i>bc_height-100; i-- ) wild_explorer.showBlock( i, "loading...", prepend );
+                var i; for ( i=bc_height; i>bc_height-100; i-- ) {
+                    var loop = async () => {
+                        if ( !wild_explorer.waitToLoadTxCounts ) return;
+                        await node_faker.waitSomeTime( 10 );
+                        return loop();
+                    }
+                    await loop();
+                    var blockhash = await node_faker.processCommand( `getblockhash ${i}` );
+                    var tx_count_data = await node_faker.processCommand( `getblockheader ${blockhash} 1` );
+                    var tx_count = tx_count_data.nTx;
+                    $( `[data-height="${i}"]` ).getElementsByClassName( "block_front" )[ 0 ].innerHTML = `<div>tx count:<br>${tx_count}</div>`;
+                }
+            })();
+        </script>
+        <div class="black-bg hidden" onclick="modalVanish();"></div>
+        <div class="modal hidden"></div>
+    </body>
+</html>
