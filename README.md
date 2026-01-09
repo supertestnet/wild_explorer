@@ -7,6 +7,9 @@ It's a block explorer, but instead of relying on a single node as a backend, it 
 # How can I try it?
 Just click here and follow the instructions: https://supertestnet.github.io/wild_explorer
 
+# Video explainer
+[![](https://supertestnet.github.io/wild_explorer/node_faker_and_wild_explorer.png)](https://www.youtube.com/watch?v=QAc4L7tSZMs)
+
 # Why did you make this?
 First I made [node_faker](https://github.com/supertestnet/node_faker), which pretends to be a bitcoin node by emulating bitcoind's api, but getting the data from electrum servers. Then I tried various apps against it, among which were [LND](https://github.com/lightningnetwork/lnd) -- which worked, albeit slowly -- and [btc-rpc-explorer](https://github.com/janoside/btc-rpc-explorer) -- which did not work.
 
